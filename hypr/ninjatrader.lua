@@ -4,7 +4,7 @@
 --
 -- Each chart is really TWO X11 windows -- an untitled one that does the actual
 -- rendering, plus a titled frame that is transient for it. Wine keeps their
--- geometry in sync (content sits at frame + {8, 31}), so tiling works, but it
+-- geometry in sync (the renderer nests inside the frame), so tiling works, but it
 -- cannot follow a workspace move: moving only the frame leaves the renderer
 -- behind and the chart shows an empty hole. Both must move together, and the
 -- untitled one has no title to match on -- so it can only be found
@@ -25,10 +25,17 @@ local SERVICE_PREFIXES = {
   "Chat",
 }
 
-local CONTENT_DX, CONTENT_DY = 8, 31
-local CONTENT_DW, CONTENT_DH = 14, 78
-local MATCH_SLOP = 4
+local EDGE_SLOP = 8
+local MIN_FILL = 0.5
 local SETTLE_MS = 250
+
+-- Only chart windows own a renderer; service windows are a single window. This
+-- is the constraint that disambiguates a stranded renderer when two workspaces
+-- happen to share a layout -- geometry alone cannot tell those apart, because
+-- every workspace tiles from the same origin at the same size.
+local function is_chart(win)
+  return ((win.title or ""):match("^Chart %- ")) ~= nil
+end
 
 local function target_ws(title)
   local instrument = title:match("^Chart %- (.+)$")
@@ -59,38 +66,42 @@ local function nt_windows()
   return out
 end
 
--- The renderer sits inset inside its frame by a fixed amount.
+-- Match the renderer to its frame by CONTAINMENT, not by a fixed inset.
 --
--- Position is the primary test and size only breaks ties. Size must NOT gate
--- the match: a stranded renderer often carries a stale width, and requiring an
--- exact size match is exactly what leaves it stranded. Position alone is
--- ambiguous across workspaces though (every workspace lays out from the same
--- origin), which is what size is for.
-local function position_matches(frame, content)
-  return math.abs(content.at.x - (frame.at.x + CONTENT_DX)) <= MATCH_SLOP
-    and math.abs(content.at.y - (frame.at.y + CONTENT_DY)) <= MATCH_SLOP
+-- The inset is decoration geometry, not a constant: it measured {8,31} under
+-- one Hyprland border/gap config and {5,19} after those changed. Hardcoding it
+-- silently strands every chart the day it shifts -- the rule stops matching,
+-- and a no-op is indistinguishable from "already in the right place". What is
+-- actually invariant is that the renderer nests inside its frame's rectangle.
+local function nests_in(frame, content)
+  return content.at.x >= frame.at.x - EDGE_SLOP
+    and content.at.y >= frame.at.y - EDGE_SLOP
+    and content.at.x + content.size.x <= frame.at.x + frame.size.x + EDGE_SLOP
+    and content.at.y + content.size.y <= frame.at.y + frame.size.y + EDGE_SLOP
+    and content.size.x <= frame.size.x
+    and content.size.y <= frame.size.y
+    -- A renderer very nearly fills its frame. Menus are untitled NinjaTrader
+    -- windows that also nest inside one, and are small; this keeps them out.
+    and (content.size.x * content.size.y) >= (frame.size.x * frame.size.y) * MIN_FILL
 end
 
-local function size_matches(frame, content)
-  return math.abs(content.size.x - (frame.size.x - CONTENT_DW)) <= MATCH_SLOP
-    and math.abs(content.size.y - (frame.size.y - CONTENT_DH)) <= MATCH_SLOP
+-- Leftover frame around the renderer. The true pair is the tightest fit, which
+-- is what separates a chart from a larger window it happens to sit inside.
+local function slack(frame, content)
+  return (frame.size.x - content.size.x) + (frame.size.y - content.size.y)
 end
 
 local function content_for(frame, windows)
-  local matches = {}
+  local best, best_slack
   for _, w in ipairs(windows) do
-    if (w.title or "") == "" and w.address ~= frame.address and position_matches(frame, w) then
-      matches[#matches + 1] = w
+    if (w.title or "") == "" and w.address ~= frame.address and nests_in(frame, w) then
+      local s = slack(frame, w)
+      if not best or s < best_slack then
+        best, best_slack = w, s
+      end
     end
   end
-  if #matches <= 1 then
-    return matches[1]
-  end
-  for _, w in ipairs(matches) do
-    if size_matches(frame, w) then
-      return w
-    end
-  end
+  return best
 end
 
 local function move(win, ws)
@@ -101,29 +112,24 @@ local function move(win, ws)
   }))
 end
 
--- Reverse of content_for. Refuses to act on a tie rather than guessing, since
--- a wrong guess drags a renderer off its own chart.
+-- Reverse of content_for. Refuses to act on an exact tie rather than guessing,
+-- since a wrong guess drags a renderer off its own chart.
 local function frame_for(content, windows)
-  local matches = {}
+  local best, best_slack, tied
   for _, w in ipairs(windows) do
-    if (w.title or "") ~= "" and w.address ~= content.address and position_matches(w, content) then
-      matches[#matches + 1] = w
-    end
-  end
-  if #matches <= 1 then
-    return matches[1]
-  end
-
-  local sized
-  for _, w in ipairs(matches) do
-    if size_matches(w, content) then
-      if sized then
-        return nil
+    if is_chart(w) and w.address ~= content.address and nests_in(w, content) then
+      local s = slack(w, content)
+      if not best or s < best_slack then
+        best, best_slack, tied = w, s, false
+      elseif s == best_slack then
+        tied = true
       end
-      sized = w
     end
   end
-  return sized
+  if tied then
+    return nil
+  end
+  return best
 end
 
 -- Moving one chart reflows the layout, so a second chart's frame can shift
@@ -137,6 +143,23 @@ local function reconcile()
       if frame and frame.workspace and frame.workspace.id ~= w.workspace.id then
         move(w, frame.workspace.id)
       end
+    end
+  end
+end
+
+-- A renderer floats on top of its frame and swallows every click, so it has to
+-- be unfocusable. This is done per-window rather than by a static rule because
+-- menus are untitled NinjaTrader windows too -- a blanket rule makes every menu
+-- close the moment it opens.
+local function mark_renderers()
+  local windows = nt_windows()
+  for _, w in ipairs(windows) do
+    if (w.title or "") == "" and frame_for(w, windows) then
+      hl.dispatch(hl.dsp.window.set_prop({
+        window = "address:" .. w.address,
+        prop = "no_focus",
+        value = 1,
+      }))
     end
   end
 end
@@ -165,10 +188,13 @@ local function route(address)
     return
   end
 
-  -- Renderer first, so it is never briefly stranded on its own.
-  local content = content_for(frame, windows)
-  if content then
-    move(content, ws)
+  -- Renderer first, so it is never briefly stranded on its own. Service windows
+  -- have none, and looking anyway risks dragging an unrelated window along.
+  if is_chart(frame) then
+    local content = content_for(frame, windows)
+    if content then
+      move(content, ws)
+    end
   end
   move(frame, ws)
 end
@@ -182,7 +208,10 @@ local function on_window(win)
   local address = win.address
   hl.timer(function()
     route(address)
-    hl.timer(reconcile, { timeout = SETTLE_MS, type = "oneshot" })
+    hl.timer(function()
+      reconcile()
+      mark_renderers()
+    end, { timeout = SETTLE_MS, type = "oneshot" })
   end, { timeout = SETTLE_MS, type = "oneshot" })
 end
 
@@ -195,5 +224,8 @@ hl.timer(function()
   for _, w in ipairs(nt_windows()) do
     route(w.address)
   end
-  hl.timer(reconcile, { timeout = SETTLE_MS, type = "oneshot" })
+  hl.timer(function()
+    reconcile()
+    mark_renderers()
+  end, { timeout = SETTLE_MS, type = "oneshot" })
 end, { timeout = SETTLE_MS, type = "oneshot" })

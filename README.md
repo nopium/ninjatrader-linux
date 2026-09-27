@@ -134,8 +134,8 @@ Everything below is Hyprland configuration, and all of it follows from one fact.
 | Frame | `Chart - MNQ SEP26` | **Owns all mouse input**; draws side panels (e.g. Chart Trader) |
 | Renderer | *(empty)* | **Draws the chart only**; handles no input |
 
-The frame is `WM_TRANSIENT_FOR` the renderer, and the renderer sits inset at
-frame `+{8,31}`. Wine keeps their geometry in sync, but a **workspace** is a
+The frame is `WM_TRANSIENT_FOR` the renderer, which nests inside the frame's
+rectangle. Wine keeps their geometry in sync, but a **workspace** is a
 window-manager concept an X client cannot see — so moving one without the other
 splits them. The symptoms are diagnostic:
 
@@ -152,21 +152,38 @@ o.window({ class = "ninjatrader\\.exe", title = "Chart - .*" }, { tile = true })
 ```
 
 > **Patterns must match the whole string.** `title = "^Chart - "` never matches
-> `Chart - MNQ SEP26`. This is the single most expensive mistake to make here,
-> because `hl.window_rule` **silently accepts** bad keys and patterns — no
-> error, nothing in `hyprctl configerrors`, the rule just never fires.
+> `Chart - MNQ SEP26`. This is the single most expensive mistake to make here:
+> `hl.window_rule` validates match property *names*, but not rule keys and not
+> patterns — so a wrong key or a non-matching pattern produces no error, nothing
+> in `hyprctl configerrors`, and the rule just never fires.
 
 ### Make the mouse work
 
-The renderer floats on top of the frame and swallows every click. Mark it
-unfocusable so events fall through:
+The renderer floats on top of the frame and swallows every click, so it has to
+be unfocusable. **This cannot be a static window rule**, and the obvious version
+is a trap:
 
 ```lua
+-- DON'T: this also kills every menu
 o.window({ class = "ninjatrader\\.exe", title = "" }, { no_focus = true })
 ```
 
-Omarchy does this for XWayland helpers in `default/hypr/windows.lua`, but that
-rule only matches an *empty* class and NT8's helpers carry a real one.
+NinjaTrader's menus are untitled windows too, so that rule matches them as well
+— and a WPF menu that cannot take focus closes the instant it opens. Every
+menu in the Control Center flashes up for about a second and vanishes.
+
+Mark only windows you have positively identified as a renderer, per-window:
+
+```lua
+hl.dispatch(hl.dsp.window.set_prop({
+  window = "address:" .. w.address,
+  prop = "no_focus",
+  value = 1,
+}))
+```
+
+Identify one by containment plus a fill test — a renderer very nearly fills its
+frame, a menu covers a small fraction of it. See `hypr/ninjatrader.lua`.
 
 ### Verifying a rule actually matches
 
@@ -196,9 +213,14 @@ are:
   class first — terminals retitle constantly and will flood the handler.
 - Defer with `hl.timer` (~250 ms). Geometry is not settled when the event fires.
 - Move the **renderer first**, then the frame.
-- Pair by **position**, using size only to break ties. Size must never gate the
-  match: a chart with a Chart Trader panel has a renderer ~200 px narrower than
-  `frame - {14,78}`, and gating on size strands it permanently.
+- Pair by **containment**, never by a fixed inset. That offset is decoration
+  geometry, not a constant — it measured `{8,31}` under one border/gap config
+  and `{5,19}` after those changed, which silently stranded every chart. Size
+  must not gate the match either: a chart with a Chart Trader panel has a
+  renderer ~200 px narrower than its frame.
+- Disambiguate with **only charts own a renderer**. Two workspaces tiling the
+  same way produce identical geometry, so a stranded renderer matches a chart
+  and a service window equally well and the tie guard refuses to act.
 - Run a **reconcile** pass afterwards. Moving one chart reflows the layout, so
   the next chart's frame shifts before Wine re-syncs its renderer. Reconcile
   pulls any renderer back to its frame's workspace, and refuses to act when a
